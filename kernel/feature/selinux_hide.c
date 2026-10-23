@@ -17,6 +17,7 @@
 #include <linux/rcupdate.h>
 #include <linux/rwlock_types.h>
 #include <linux/jump_label.h>
+#include <linux/vmalloc.h>
 #include <selinux/sepolicy.h>
 #include <ss/policydb.h>
 
@@ -208,6 +209,302 @@ __maybe_static void security_compute_av_user_with_policy(struct selinux_policy *
 
 #ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
 
+/*
+ * Clean (stock) policy support.
+ *
+ * backup_sepolicy/backup_policydb is captured right before KernelSU injects
+ * its own rules, but on devices that also run Magisk it already contains
+ * Magisk's policy patch.  Magisk keeps a copy of the untouched policy at
+ * /.magisk/selinux/load before applying its rules, so load that blob when it
+ * is available and use it for all SELinux queries coming from app UIDs.
+ *
+ * This makes the kernel answer /sys/fs/selinux/{access,context} and
+ * /proc/self/attr/current exactly like a stock device: hidden types do not
+ * exist and "indirect" probes between stock contexts (e.g. kernel ->
+ * adb_data_file) are evaluated against the stock allow rules instead of
+ * against rules injected by KernelSU/Magisk/LSPosed.
+ *
+ * If the file is not present (KernelSU-only device), the existing backup
+ * policy is already the stock policy and is used as-is.
+ */
+#define KSU_CLEAN_POLICY_MAX_SIZE (8U * 1024U * 1024U)
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+static struct selinux_policy *ksu_clean_sepolicy;
+#define ksu_hide_sepolicy() (ksu_clean_sepolicy ? ksu_clean_sepolicy : backup_sepolicy)
+#else
+static struct policydb *ksu_clean_policydb;
+static struct sidtab *ksu_clean_sidtab;
+#define ksu_hide_policydb() (ksu_clean_policydb ? ksu_clean_policydb : backup_policydb)
+#define ksu_hide_sidtab() (ksu_clean_sidtab ? ksu_clean_sidtab : backup_sidtab)
+#endif
+
+static bool ksu_clean_policy_attempted;
+
+static bool ksu_selinux_hide_read_file(const char *path, void **out, size_t *out_len)
+{
+    struct file *filp;
+    loff_t size, pos = 0;
+    void *buf;
+    ssize_t nread;
+
+    *out = NULL;
+    *out_len = 0;
+
+    filp = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR_OR_NULL(filp))
+        return false;
+
+    size = vfs_llseek(filp, 0, SEEK_END);
+    if (size <= 0 || size > KSU_CLEAN_POLICY_MAX_SIZE)
+        goto out_close;
+
+    if (vfs_llseek(filp, 0, SEEK_SET) < 0)
+        goto out_close;
+
+    buf = vmalloc((size_t)size);
+    if (!buf)
+        goto out_close;
+
+    while (pos < size) {
+        nread = ksu_kernel_read_compat(filp, (char *)buf + pos, (size_t)(size - pos), &pos);
+        if (nread <= 0)
+            break;
+    }
+
+    if (pos != size) {
+        vfree(buf);
+        goto out_close;
+    }
+
+    *out = buf;
+    *out_len = (size_t)size;
+
+out_close:
+    filp_close(filp, NULL);
+    return *out != NULL;
+}
+
+static bool ksu_selinux_hide_parse_clean_policy(void *blob, size_t len)
+{
+    struct policy_file fp;
+    int rc;
+
+    fp.data = blob;
+    fp.len = len;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+    struct selinux_policy *pol;
+    struct sidtab *sidtab;
+
+    pol = kzalloc(sizeof(*pol), GFP_KERNEL);
+    sidtab = kzalloc(sizeof(*sidtab), GFP_KERNEL);
+    if (!pol || !sidtab) {
+        kfree(pol);
+        kfree(sidtab);
+        return false;
+    }
+
+    rc = policydb_read(&pol->policydb, &fp);
+    if (rc) {
+        pr_warn("selinux_hide: clean policy policydb_read failed: %d\n", rc);
+        goto err_pol;
+    }
+
+    rc = policydb_load_isids(&pol->policydb, sidtab);
+    if (rc) {
+        pr_warn("selinux_hide: clean policy policydb_load_isids failed: %d\n", rc);
+        goto err_pol;
+    }
+
+    pol->sidtab = sidtab;
+    ksu_clean_sepolicy = pol;
+    return true;
+
+err_pol:
+    ksu_destroy_sepolicy(pol);
+    kfree(sidtab);
+    return false;
+#else
+    struct policydb *policydb;
+    struct sidtab *sidtab;
+
+    policydb = kzalloc(sizeof(*policydb), GFP_KERNEL);
+    sidtab = kzalloc(sizeof(*sidtab), GFP_KERNEL);
+    if (!policydb || !sidtab) {
+        kfree(policydb);
+        kfree(sidtab);
+        return false;
+    }
+
+    rc = policydb_read(policydb, &fp);
+    if (rc) {
+        pr_warn("selinux_hide: clean policy policydb_read failed: %d\n", rc);
+        goto err_db;
+    }
+
+    rc = policydb_load_isids(policydb, sidtab);
+    if (rc) {
+        pr_warn("selinux_hide: clean policy policydb_load_isids failed: %d\n", rc);
+        goto err_db;
+    }
+
+    ksu_clean_policydb = policydb;
+    ksu_clean_sidtab = sidtab;
+    return true;
+
+err_db:
+    ksu_destroy_policydb(policydb);
+    kfree(sidtab);
+    kfree(policydb);
+    return false;
+#endif
+}
+
+static void ksu_selinux_hide_free_clean_policy(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+    if (ksu_clean_sepolicy) {
+        if (ksu_clean_sepolicy->sidtab) {
+            sidtab_destroy(ksu_clean_sepolicy->sidtab);
+            kfree(ksu_clean_sepolicy->sidtab);
+            ksu_clean_sepolicy->sidtab = NULL;
+        }
+        ksu_destroy_sepolicy(ksu_clean_sepolicy);
+        ksu_clean_sepolicy = NULL;
+    }
+#else
+    if (ksu_clean_sidtab) {
+        sidtab_destroy(ksu_clean_sidtab);
+        kfree(ksu_clean_sidtab);
+        ksu_clean_sidtab = NULL;
+    }
+    if (ksu_clean_policydb) {
+        ksu_destroy_policydb(ksu_clean_policydb);
+        kfree(ksu_clean_policydb);
+        ksu_clean_policydb = NULL;
+    }
+#endif
+}
+
+static void ksu_selinux_hide_capture_clean_policy(void)
+{
+    static const char *const paths[] = {
+        "/.magisk/selinux/load",
+        "/sbin/.magisk/selinux/load",
+        "/debug_ramdisk/.magisk/selinux/load",
+        ".magisk/selinux/load",
+    };
+    int i;
+
+    if (ksu_clean_policy_attempted)
+        return;
+    ksu_clean_policy_attempted = true;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+    if (ksu_clean_sepolicy)
+        return;
+#else
+    if (ksu_clean_policydb)
+        return;
+#endif
+
+    for (i = 0; i < (int)ARRAY_SIZE(paths); i++) {
+        void *blob = NULL;
+        size_t len = 0;
+
+        if (!ksu_selinux_hide_read_file(paths[i], &blob, &len))
+            continue;
+
+        if (ksu_selinux_hide_parse_clean_policy(blob, len)) {
+            pr_info("selinux_hide: loaded clean stock policy from %s (%zu bytes)\n", paths[i], len);
+            vfree(blob);
+            return;
+        }
+
+        pr_warn("selinux_hide: cannot parse clean policy from %s\n", paths[i]);
+        vfree(blob);
+    }
+
+    /* Allow a later enable() call to retry, e.g. after Magisk has mounted. */
+    ksu_clean_policy_attempted = false;
+    pr_info("selinux_hide: no clean stock policy snapshot, using backup policy\n");
+}
+
+static struct policydb *ksu_hide_context_policydb(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+    if (ksu_clean_sepolicy)
+        return &ksu_clean_sepolicy->policydb;
+    if (backup_sepolicy)
+        return &backup_sepolicy->policydb;
+#else
+    if (ksu_clean_policydb)
+        return ksu_clean_policydb;
+    if (backup_policydb)
+        return backup_policydb;
+#endif
+    return NULL;
+}
+
+/*
+ * Fast type validation against the hidden policy.
+ *
+ * selinux_setprocattr() first parses user, role and type from the context.
+ * The invalid-context timing probe compares an invalid type (A) with the same
+ * string whose first byte is a newline (B).  Routing both payloads through
+ * this single, allocation-free type lookup keeps their write latencies
+ * identical, while the full dual-policy conversion is still used for every
+ * context whose type actually exists in the hidden policy.
+ *
+ * The adbroot guard remains a separate check after this lookup.  It is not
+ * reached by the invalid-type timing payloads, so it does not affect their
+ * A/B symmetry.
+ */
+static bool ksu_selinux_hide_type_allowed(struct policydb *db, const char *context, size_t size)
+{
+    const char *p, *end, *type, *type_end;
+    struct type_datum *typdatum;
+    char name[256];
+    size_t type_len;
+
+    if (!db)
+        return true;
+    if (!context || !size)
+        return false;
+
+    end = context + size;
+
+    /* Skip "user:" and "role:". */
+    p = memchr(context, ':', size);
+    if (!p)
+        return false;
+    p++;
+    p = memchr(p, ':', end - p);
+    if (!p)
+        return false;
+    p++;
+
+    type = p;
+    type_end = memchr(type, ':', end - type);
+    if (!type_end)
+        type_end = end;
+
+    type_len = (size_t)(type_end - type);
+    if (!type_len)
+        return false;
+
+    /* Let the full parser handle unusually long or embedded-NUL names. */
+    if (type_len >= sizeof(name) || memchr(type, '\0', type_len))
+        return true;
+
+    memcpy(name, type, type_len);
+    name[type_len] = '\0';
+
+    typdatum = symtab_search(&db->p_types, name);
+    return typdatum && !typdatum->attribute;
+}
+
 static write_op_fn *context_write, *access_write;
 static write_op_fn orig_context_write, orig_access_write;
 
@@ -243,6 +540,9 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
     if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
         return orig_context_write(file, buf, size);
     }
+    if (strstr(buf, "u:r:adbroot:s0")) {
+        return -EINVAL;
+    }
     char *canon = NULL;
     u32 sid, len;
     ssize_t length;
@@ -253,35 +553,36 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
         goto out;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-    length = security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length =
+        security_context_to_sid_with_policy(ksu_hide_sepolicy(), buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
     if (length) {
         goto out;
     }
 
-    length = security_sid_to_context_with_policy(backup_sepolicy, sid, &canon, &len);
+    length = security_sid_to_context_with_policy(ksu_hide_sepolicy(), sid, &canon, &len);
     if (length)
         goto out;
 #elif defined(KSU_COMPAT_USE_SELINUX_STATE)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) || defined(KSU_COMPAT_SIDTAB_AS_REFERENCE)
-    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, backup_policydb,
-                                         backup_sidtab, buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
 #else
-    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, backup_policydb,
-                                         backup_sidtab, buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
 #endif
     if (length)
         goto out;
 
-    length = ksu_security_sid_to_context(backup_policydb, backup_sidtab, sid, &canon, &len);
+    length = ksu_security_sid_to_context(ksu_hide_policydb(), ksu_hide_sidtab(), sid, &canon, &len);
     if (length)
         goto out;
 #else
-    length = ksu_security_context_to_sid(&policydb, sidtab_ptr, backup_policydb, backup_sidtab, buf, size, &sid,
+    length = ksu_security_context_to_sid(&policydb, sidtab_ptr, ksu_hide_policydb(), ksu_hide_sidtab(), buf, size, &sid,
                                          SECSID_NULL, GFP_KERNEL, NULL, NULL);
     if (length)
         goto out;
 
-    length = ksu_security_sid_to_context(backup_policydb, backup_sidtab, sid, &canon, &len);
+    length = ksu_security_sid_to_context(ksu_hide_policydb(), ksu_hide_sidtab(), sid, &canon, &len);
     if (length)
         goto out;
 #endif
@@ -313,6 +614,10 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
     struct av_decision avd;
     ssize_t length;
 
+    if ((strstr(buf, "u:r:shell:s0") && strstr(buf, "u:r:su:s0")) || strstr(buf, "u:r:fsck_untrusted:s0") || strstr(buf, "u:r:adbroot:s0")) {
+        length = -EINVAL;
+        goto out;
+    }
     length = ksu_avc_has_perm_compat(current_sid(), SECINITSID_SECURITY, SECCLASS_SECURITY, SECURITY__COMPUTE_AV, NULL);
     if (length)
         goto out;
@@ -335,53 +640,53 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
     tconlen = strlen(tcon);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-    length =
-        security_context_to_sid_with_policy(backup_sepolicy, scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = security_context_to_sid_with_policy(ksu_hide_sepolicy(), scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL,
+                                                 NULL, NULL);
     if (length) {
         goto out;
     }
 
-    length =
-        security_context_to_sid_with_policy(backup_sepolicy, tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = security_context_to_sid_with_policy(ksu_hide_sepolicy(), tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL,
+                                                 NULL, NULL);
     if (length) {
         goto out;
     }
 
-    security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);
+    security_compute_av_user_with_policy(ksu_hide_sepolicy(), ssid, tsid, tclass, &avd);
 #elif defined(KSU_COMPAT_USE_SELINUX_STATE)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) || defined(KSU_COMPAT_SIDTAB_AS_REFERENCE)
-    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, backup_policydb,
-                                         backup_sidtab, scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
 #else
-    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, backup_policydb,
-                                         backup_sidtab, scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
 #endif
     if (length)
         goto out;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) || defined(KSU_COMPAT_SIDTAB_AS_REFERENCE)
-    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, backup_policydb,
-                                         backup_sidtab, tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
 #else
-    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, backup_policydb,
-                                         backup_sidtab, tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
 #endif
     if (length)
         goto out;
 
-    ksu_security_compute_av_user(backup_policydb, backup_sidtab, ssid, tsid, tclass, &avd);
+    ksu_security_compute_av_user(ksu_hide_policydb(), ksu_hide_sidtab(), ssid, tsid, tclass, &avd);
 #else
-    length = ksu_security_context_to_sid(&policydb, sidtab_ptr, backup_policydb, backup_sidtab, scon, sconlen, &ssid,
-                                         SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&policydb, sidtab_ptr, ksu_hide_policydb(), ksu_hide_sidtab(), scon, sconlen,
+                                         &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
     if (length)
         goto out;
 
-    length = ksu_security_context_to_sid(&policydb, sidtab_ptr, backup_policydb, backup_sidtab, tcon, tconlen, &tsid,
-                                         SECSID_NULL, GFP_KERNEL, NULL, NULL);
+    length = ksu_security_context_to_sid(&policydb, sidtab_ptr, ksu_hide_policydb(), ksu_hide_sidtab(), tcon, tconlen,
+                                         &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
     if (length)
         goto out;
 
-    ksu_security_compute_av_user(backup_policydb, backup_sidtab, ssid, tsid, tclass, &avd);
+    ksu_security_compute_av_user(ksu_hide_policydb(), ksu_hide_sidtab(), ssid, tsid, tclass, &avd);
 #endif
 
     // stock reads 1; a loader load_policy may have bumped the backup before we load
@@ -469,31 +774,52 @@ int __nocfi ksu_handle_selinux_setprocattr(struct task_struct *p, char *name, vo
     if (error)
         return error;
 
-    /* Obtain a SID for the context, if one was specified. */
-    if (size && str[0] && str[0] != '\n') {
-        if (str[size - 1] == '\n') {
-            str[size - 1] = 0;
-            size--;
+    if (size && str[size - 1] == '\n') {
+        str[size - 1] = 0;
+        size--;
+    }
+
+    /*
+     * Reject contexts whose type is absent from the hidden policy before the
+     * expensive dual-policy conversion.  Both the invalid-type payload and
+     * its leading-newline control take this exact path, so the new App Zygote
+     * timing probe cannot separate them by write latency.
+     */
+    {
+        bool leading_newline = size && str[0] == '\n';
+
+        if (!ksu_selinux_hide_type_allowed(ksu_hide_context_policydb(), str, size))
+            return -EINVAL;
+
+        /* The stock handler skips conversion for a leading newline and later
+         * aborts with -EINVAL because no SID was produced.  Return the same
+         * error directly, after the same type lookup, to keep timing flat. */
+        if (leading_newline)
+            return -EINVAL;
+
+        /* Only reached for a type present in the hidden policy; the timing
+         * payloads above have already returned, so this stays off their path. */
+        if (strstr(str, "u:r:adbroot:s0")) {
+            return -EINVAL;
         }
+    }
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-        error2 = security_context_to_sid_with_policy(backup_sepolicy, value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL,
-                                                     &sid, &error);
+    error2 = security_context_to_sid_with_policy(ksu_hide_sepolicy(), value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL,
+                                                 &sid, &error);
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) || defined(KSU_COMPAT_SIDTAB_AS_REFERENCE)) &&                    \
     defined(KSU_COMPAT_USE_SELINUX_STATE)
-        error2 =
-            ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, backup_policydb,
-                                        backup_sidtab, value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL, &sid, &error);
+    error2 = ksu_security_context_to_sid(&selinux_state.ss->policydb, selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL, &sid, &error);
 #elif defined(KSU_COMPAT_USE_SELINUX_STATE)
-        error2 =
-            ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, backup_policydb,
-                                        backup_sidtab, value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL, &sid, &error);
+    error2 = ksu_security_context_to_sid(&selinux_state.ss->policydb, &selinux_state.ss->sidtab, ksu_hide_policydb(),
+                                         ksu_hide_sidtab(), value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL, &sid, &error);
 #else
-        error2 = ksu_security_context_to_sid(&policydb, sidtab_ptr, backup_policydb, backup_sidtab, value, size,
-                                             &tmp_sid, SECSID_NULL, GFP_KERNEL, &sid, &error);
+    error2 = ksu_security_context_to_sid(&policydb, sidtab_ptr, ksu_hide_policydb(), ksu_hide_sidtab(), value, size,
+                                         &tmp_sid, SECSID_NULL, GFP_KERNEL, &sid, &error);
 #endif
-        if (error2 || error)
-            return error2 ?: error;
-    }
+    if (error2 || error)
+        return error2 ?: error;
 
     new = prepare_creds();
     if (!new)
@@ -553,6 +879,8 @@ typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp)
 static sel_open_handle_status_fn orig_sel_open_handle_status, *sel_open_handle_status_slot;
 static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
 {
+    int ret;
+
     if (likely(ksu_get_uid_t(current_uid()) >= 10000 && ksu_selinux_hide_enabled)) {
         void *data;
         mutex_lock(ksu_selinux_status_lock);
@@ -562,9 +890,28 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
             filp->private_data = data;
             return 0;
         }
+
+        /*
+         * The real status page may not have existed when the second-stage
+         * hook ran.  Let the original open allocate it, snapshot it with
+         * clean counters, then hand the clean page to the app.  Without
+         * this, the first app open would read the dirty live page.
+         */
+        ret = orig_sel_open_handle_status(inode, filp);
+        if (ret)
+            return ret;
+
+        initialize_fake_status();
+
+        mutex_lock(ksu_selinux_status_lock);
+        data = fake_status;
+        mutex_unlock(ksu_selinux_status_lock);
+        if (data)
+            filp->private_data = data;
+        return 0;
     }
 
-    int ret = orig_sel_open_handle_status(inode, filp);
+    ret = orig_sel_open_handle_status(inode, filp);
 #ifdef KSU_COMPAT_USE_STATIC_KEY
     if (static_branch_unlikely(&fake_status_initialize_key) && !ret && !fake_status) {
         initialize_fake_status();
@@ -651,6 +998,10 @@ static int ksu_selinux_hide_enable()
 {
     int ret;
     pr_info("selinux_hide: init selinux hide\n");
+#ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
+    /* Late-loaded modules did not pass through the second-stage hook. */
+    ksu_selinux_hide_capture_clean_policy();
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
     if (!backup_sepolicy) {
         pr_err("no backup sepolicy available, please save feature and reboot to retry!\n");
@@ -883,6 +1234,14 @@ static const struct ksu_feature_handler selinux_hide_handler = {
 
 void ksu_selinux_hide_handle_second_stage()
 {
+#ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
+    /*
+     * Capture Magisk's pre-patch policy snapshot before KernelSU applies its
+     * own rules.  On KernelSU-only devices this file does not exist and the
+     * backup policy (already stock) is used instead.
+     */
+    ksu_selinux_hide_capture_clean_policy();
+#endif
     initialize_fake_status();
     // https://github.com/torvalds/linux/blame/e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7/security/selinux/selinuxfs.c#L2014
     if (fake_status) {
@@ -941,11 +1300,22 @@ void __exit ksu_selinux_hide_exit()
         __free_page(fake_status);
     fake_status = NULL;
     mutex_unlock(ksu_selinux_status_lock);
+#ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
+    mutex_lock(&selinux_hide_mutex);
+    ksu_selinux_hide_free_clean_policy();
+    mutex_unlock(&selinux_hide_mutex);
+#endif
 }
 
 void ksu_selinux_hide_drop_backup_if_unused()
 {
     mutex_lock(&selinux_hide_mutex);
+#ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
+    if (!ksu_selinux_hide_running && ksu_clean_policy_attempted) {
+        ksu_selinux_hide_free_clean_policy();
+        ksu_clean_policy_attempted = false;
+    }
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
     if (!ksu_selinux_hide_running && backup_sepolicy) {
         pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
@@ -975,6 +1345,29 @@ void ksu_selinux_hide_drop_backup_if_unused()
     }
 #endif
     mutex_unlock(&selinux_hide_mutex);
+}
+
+/*
+ * Present the counters of a clean boot.  The real status page counts every
+ * policy reload (Magisk/KernelSU/LSPosed), and DirtySepolicy compares both
+ * "sequence" and "policyload" against the values a stock boot produces:
+ *   kernel <  6.10: sequence=0, policyload=0
+ *   kernel >= 6.10: sequence=4, policyload=1
+ */
+static void ksu_fill_clean_status(struct selinux_kernel_status *status)
+{
+    status->version = 1;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+    status->sequence = 4;
+    status->policyload = 1;
+#else
+    status->sequence = 0;
+    status->policyload = 0;
+#endif
+    status->enforcing = 1;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+    status->deny_unknown = 1;
+#endif
 }
 
 // for susfs xN
@@ -1020,10 +1413,6 @@ __maybe_static void initialize_fake_status()
     }
 
     struct selinux_kernel_status *status = page_address(selinux_status_page);
-    if (!status->enforcing && !ksu_late_loaded) {
-        pr_warn("initialize_fake_status: skip not enforcing\n");
-        goto out;
-    }
 
     struct page *new_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
     if (!new_page) {
@@ -1033,22 +1422,12 @@ __maybe_static void initialize_fake_status()
 
     struct selinux_kernel_status *new_status = page_address(new_page);
     memcpy(new_status, status, sizeof(*status));
-    if (ksu_late_loaded) {
-        // In late_load mode the loader may have reloaded sepolicy before us,
-        // so the captured page is not stock. Serve what a stock boot ends
-        // with instead: creation sentinel below 6.10, one load plus one
-        // setenforce above.
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
-        new_status->sequence = 4;
-        new_status->policyload = 1;
-#else
-        new_status->sequence = 0;
-        new_status->policyload = 0;
-#endif
-        if (!new_status->enforcing) {
-            new_status->enforcing = 1;
-        }
-    }
+    /*
+     * Never expose the live counters: in late-load mode the loader may have
+     * reloaded sepolicy before us, and on normal boots Magisk/KernelSU can
+     * increment them as well.
+     */
+    ksu_fill_clean_status(new_status);
 
     fake_status = new_page;
     pr_info("initialize_fake_status initialized: sequence=%d, policyload=%d, enforcing=%d\n", new_status->sequence,
